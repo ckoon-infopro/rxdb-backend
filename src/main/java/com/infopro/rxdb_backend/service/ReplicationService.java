@@ -3,21 +3,20 @@ package com.infopro.rxdb_backend.service;
 import com.infopro.rxdb_backend.dto.CheckpointDto;
 import com.infopro.rxdb_backend.dto.ReplicationDocumentsDto;
 import com.infopro.rxdb_backend.dto.ChangeRowDto;
-import com.infopro.rxdb_backend.model.Document; // Added
-import com.infopro.rxdb_backend.repository.DocumentRepository; // Added
-import org.springframework.beans.factory.annotation.Autowired; // Added
-import org.springframework.data.domain.PageRequest; // Added
-import org.springframework.data.domain.Pageable; // Added
+import com.infopro.rxdb_backend.model.Document; 
+import com.infopro.rxdb_backend.repository.DocumentRepository; 
+import org.springframework.beans.factory.annotation.Autowired; 
+import org.springframework.data.domain.PageRequest; 
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.annotation.Transactional; // Added
+import org.springframework.transaction.annotation.Transactional;
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-// import java.util.concurrent.ConcurrentHashMap; // Removed
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.stream.Collectors; // Added
+import java.util.stream.Collectors; 
 
 @Service
 public class ReplicationService {
@@ -159,8 +158,6 @@ public class ReplicationService {
             Map<String, Object> assumedMasterStateClient = changeRow.getAssumedMasterState();
 
             if (newDocClientState == null || newDocClientState.get("id") == null) {
-                System.err.println(
-                        "Service: Change row with invalid newDocumentState received, skipping: " + newDocClientState);
                 conflicts.add(createErrorEntry("Malformed change row",
                         newDocClientState != null ? newDocClientState.toString() : "null"));
                 continue;
@@ -180,11 +177,19 @@ public class ReplicationService {
                     // Client provided an assumed state. Compare its updatedAt with server's
                     // updatedAt.
                     Long serverUpdatedAt = existingDoc.getUpdatedAt();
+                    
                     Object clientAssumedUpdatedAtObj = assumedMasterStateClient.get("updatedAt");
                     Long clientAssumedUpdatedAt = null;
                     if (clientAssumedUpdatedAtObj instanceof Number) {
                         clientAssumedUpdatedAt = ((Number) clientAssumedUpdatedAtObj).longValue();
+                    } else if (clientAssumedUpdatedAtObj instanceof String) {
+                        try {
+                            clientAssumedUpdatedAt = Long.parseLong((String) clientAssumedUpdatedAtObj);
+                        } catch (NumberFormatException e) {
+                            System.err.println("Invalid updatedAt format: " + clientAssumedUpdatedAtObj);
+                        }
                     }
+
 
                     // Conflict if server's updatedAt does not match client's assumed updatedAt.
                     // (Handles cases where one is null and the other isn't, or both non-null but
