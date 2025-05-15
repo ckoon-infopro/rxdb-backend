@@ -3,158 +3,297 @@ package com.infopro.rxdb_backend.service;
 import com.infopro.rxdb_backend.dto.CheckpointDto;
 import com.infopro.rxdb_backend.dto.ReplicationDocumentsDto;
 import com.infopro.rxdb_backend.dto.ChangeRowDto;
+import com.infopro.rxdb_backend.model.Document; // Added
+import com.infopro.rxdb_backend.repository.DocumentRepository; // Added
+import org.springframework.beans.factory.annotation.Autowired; // Added
+import org.springframework.data.domain.PageRequest; // Added
+import org.springframework.data.domain.Pageable; // Added
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional; // Added
 
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+// import java.util.concurrent.ConcurrentHashMap; // Removed
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.stream.Collectors; // Added
 
 @Service
 public class ReplicationService {
 
-    // In-memory storage for documents and checkpoints for demonstration purposes.
-    // In a real application, you would use a persistent database.
-    private final Map<String, Map<String, Object>> documentsStore = new ConcurrentHashMap<>();
-    private final AtomicLong serverCheckpoint = new AtomicLong(System.currentTimeMillis());
-    private final List<Map<String, Object>> serverDocuments = new ArrayList<>(); // Simulates a DB
+    private final DocumentRepository documentRepository;
+    private final AtomicLong serverCheckpointTimestamp = new AtomicLong(0); // Stores the last known server timestamp
+                                                                            // for checkpointing
+
+    @Autowired
+    public ReplicationService(DocumentRepository documentRepository) {
+        this.documentRepository = documentRepository;
+        // Initialize checkpoint from DB or set to a sensible default if DB is empty
+        updateServerCheckpointTimestamp();
+    }
+
+    private void updateServerCheckpointTimestamp() {
+        // This could be more sophisticated, e.g., storing a dedicated checkpoint
+        // document
+        // For now, use the latest updatedAt from any document or current time if no
+        // documents
+        documentRepository
+                .findAll(PageRequest.of(0, 1,
+                        org.springframework.data.domain.Sort.by(org.springframework.data.domain.Sort.Direction.DESC,
+                                "updatedAt")))
+                .stream()
+                .findFirst()
+                .ifPresentOrElse(
+                        doc -> serverCheckpointTimestamp.set(doc.getUpdatedAt()),
+                        () -> serverCheckpointTimestamp.set(System.currentTimeMillis()) // Fallback if no documents
+                );
+    }
 
     /**
      * Handles pulling changes from the server.
+     * 
      * @param lastClientCheckpoint The last checkpoint received from the client.
-     * @param limit The maximum number of documents to return.
-     * @return ReplicationDocumentsDto containing documents and the new server checkpoint.
+     * @param limit                The maximum number of documents to return.
+     * @return ReplicationDocumentsDto containing documents and the new server
+     *         checkpoint.
      */
-    public ReplicationDocumentsDto<Map<String, Object>> pullFromServer(String updatedAt, String id, int limit) {
-        System.out.println("Service: Pulling changes. UpdatedAt: " + updatedAt + ", ID: " + id + ", Limit: " + limit);
+    @Transactional(readOnly = true)
+    public ReplicationDocumentsDto<Map<String, Object>> pullFromServer(String clientUpdatedAtStr, String lastDocId,
+            int limit) {
+        System.out.println("Service: Pulling changes. ClientUpdatedAt: " + clientUpdatedAtStr + ", LastDocId: "
+                + lastDocId + ", Limit: " + limit);
 
-        // Simulate fetching documents newer than the client's checkpoint
-        // This is a very basic simulation. A real implementation would query a database based on the checkpoint.
-        List<Map<String, Object>> newDocuments = new ArrayList<>();
-        long clientCp = 0;
-        if (updatedAt != null && !updatedAt.isEmpty()) {
+        long clientUpdatedAt = 0L;
+        if (clientUpdatedAtStr != null && !clientUpdatedAtStr.isEmpty()) {
             try {
-                clientCp = Long.parseLong(updatedAt);
+                clientUpdatedAt = Long.parseLong(clientUpdatedAtStr);
             } catch (NumberFormatException e) {
-                System.err.println("Invalid updatedAt format: " + updatedAt);
-                // Potentially handle error or default to 0
+                System.err.println("Invalid clientUpdatedAtStr format: " + clientUpdatedAtStr + ". Defaulting to 0.");
             }
         }
+        // If lastDocId is null or empty, it implies the client is asking for documents
+        // strictly newer than clientUpdatedAt.
+        // If client sends "0" or an empty string for lastDocId, we might need a
+        // specific sentinel value for the query if the ID column cannot be null.
+        // For simplicity, if lastDocId is empty, we can use a value that's
+        // lexicographically smaller than any possible ID (e.g., empty string if IDs are
+        // non-empty).
+        // Or, adjust the query in DocumentRepository to handle null/empty lastDocId
+        // appropriately.
+        String effectiveLastDocId = (lastDocId == null || lastDocId.isEmpty()) ? "" : lastDocId; // Adjust if your IDs
+                                                                                                 // have specific
+                                                                                                 // constraints
 
-        synchronized (serverDocuments) {
-            for (Map<String, Object> doc : serverDocuments) {
-                // Assuming documents have a 'updated_at' field that's a long timestamp
-                // Or, if checkpoints are sequential, compare directly.
-                // For this example, let's assume checkpoint is a timestamp and documents have 'updated_at'
-                // This logic needs to be robust based on your checkpoint strategy.
-                // Here, we'll just send all documents if clientCp is 0, or newer ones.
-                // This is a placeholder for actual checkpoint logic.
-                if (newDocuments.size() < limit) {
-                    // Simple example: if doc has 'id' and 'updated_at', and 'updated_at' > clientCp
-                    // For now, let's just add from the stored documents if they are "newer"
-                    // This part needs to be adapted to how you manage document versions and checkpoints.
-                    newDocuments.add(new HashMap<>(doc)); // Send a copy
-                }
-            }
+        Pageable pageable = PageRequest.of(0, limit);
+        List<Document> pulledDocs;
+
+        if (clientUpdatedAt == 0 && (effectiveLastDocId == null || effectiveLastDocId.isEmpty())) {
+            // Client has no checkpoint or a very old one, send all documents up to limit
+            // Assuming findAllByOrderByUpdatedAtAscIdAsc will be changed or
+            // replaced
+            // For now, let's use a general findAll or adjust repository method
+            pulledDocs = documentRepository.findAllByOrderByUpdatedAtAscIdAsc(pageable); // Placeholder, needs
+                                                                                         // repository adjustment
+        } else {
+            // Client has a checkpoint, fetch documents newer than it
+            pulledDocs = documentRepository.findNewerThanCheckpoint(clientUpdatedAt, effectiveLastDocId, pageable);
         }
 
-        String newServerCheckpoint = String.valueOf(serverCheckpoint.get());
-        System.out.println("Service: Sending " + newDocuments.size() + " documents. New server checkpoint: " + newServerCheckpoint);
-        return new ReplicationDocumentsDto<>(newDocuments, newServerCheckpoint);
+        List<Map<String, Object>> documentsToReplicate = pulledDocs.stream()
+                .map(doc -> {
+                    Map<String, Object> docMap = new HashMap<>(doc.getData()); // Start with the JSON data
+                    docMap.put("id", doc.getId());
+                    docMap.put("updatedAt", doc.getUpdatedAt()); // Ensure this is part of the replicated doc if client
+                                                                 // expects it
+                    return docMap;
+                })
+                .collect(Collectors.toList());
+
+        // Determine the new server checkpoint based on the last document sent, or
+        // current server checkpoint if no documents sent
+        String newServerCheckpointStr;
+        if (!documentsToReplicate.isEmpty()) {
+            Map<String, Object> lastSentDoc = documentsToReplicate.get(documentsToReplicate.size() - 1);
+            // RxDB expects checkpoint as an object { lastDocId: string, lastUpdatedAt:
+            // number } or similar
+            // Here, we'll simplify to a string concatenation for demonstration, but a
+            // structured object is better.
+            // The checkpoint should represent the state *after* these documents.
+            // For RxDB, the checkpoint is typically the *last returned document's*
+            // (updatedAt, id).
+            newServerCheckpointStr = lastSentDoc.get("updatedAt") + "_" + lastSentDoc.get("id");
+        } else {
+            // No documents to send, server checkpoint remains its current latest known
+            // state or a minimal value if nothing exists
+            // This needs to align with how client handles empty pulls and subsequent
+            // requests.
+            // A common strategy is to return the client's own checkpoint if nothing newer,
+            // or a server's 'current' minimal checkpoint.
+            updateServerCheckpointTimestamp(); // Refresh current server timestamp
+            newServerCheckpointStr = String.valueOf(serverCheckpointTimestamp.get()) + "_z"; // 'z' to be
+                                                                                             // lexicographically large
+                                                                                             // for ID part
+        }
+
+        System.out.println("Service: Sending " + documentsToReplicate.size() + " documents. New server checkpoint: "
+                + newServerCheckpointStr);
+        return new ReplicationDocumentsDto<>(documentsToReplicate, newServerCheckpointStr);
     }
 
     /**
      * Handles pushing changes from the client to the server.
+     * 
      * @param clientDocuments List of documents from the client.
      * @return List of conflicts (empty in this basic example).
      */
+    @Transactional
     public List<Map<String, Object>> pushToServer(List<ChangeRowDto> changeRows) {
         System.out.println("Service: Receiving " + changeRows.size() + " change rows from client.");
         List<Map<String, Object>> conflicts = new ArrayList<>();
+        long currentProcessingTime = System.currentTimeMillis(); // Use a consistent timestamp for all docs in this
+                                                                 // batch
 
-        synchronized (serverDocuments) { // Synchronizes access to documentsStore and serverDocuments
-            for (ChangeRowDto changeRow : changeRows) {
-                Map<String, Object> newDocumentState = changeRow.getNewDocumentState();
-                Map<String, Object> assumedMasterState = changeRow.getAssumedMasterState();
+        for (ChangeRowDto changeRow : changeRows) {
+            Map<String, Object> newDocClientState = changeRow.getNewDocumentState();
+            Map<String, Object> assumedMasterStateClient = changeRow.getAssumedMasterState();
 
-                if (newDocumentState == null || newDocumentState.get("id") == null) {
-                    System.err.println("Service: Change row with invalid newDocumentState received, skipping: " + changeRow);
-                    // Consider adding malformed input to a special error list to return to client
-                    Map<String, Object> errorEntry = new HashMap<>();
-                    errorEntry.put("error", "Malformed change row");
-                    errorEntry.put("changeRow", changeRow.toString()); // Or a more structured representation
-                    conflicts.add(errorEntry); // Or a dedicated error list
-                    continue;
-                }
-                String docId = (String) newDocumentState.get("id");
+            if (newDocClientState == null || newDocClientState.get("id") == null) {
+                System.err.println(
+                        "Service: Change row with invalid newDocumentState received, skipping: " + newDocClientState);
+                conflicts.add(createErrorEntry("Malformed change row",
+                        newDocClientState != null ? newDocClientState.toString() : "null"));
+                continue;
+            }
+            String docId = (String) newDocClientState.get("id");
 
-                // Fetch the current state of the document from the server's primary store
-                Map<String, Object> realMasterState = documentsStore.get(docId);
+            Document existingDoc = documentRepository.findById(docId).orElse(null);
+            boolean conflictDetected = false;
 
-                boolean conflictDetected = false;
-                if (realMasterState != null) { // Document exists on server
-                    if (assumedMasterState == null) {
-                        // Client assumes document is new (no assumedMasterState), but it exists on server.
+            if (existingDoc != null) { // Document exists on server
+                if (assumedMasterStateClient == null) {
+                    // Client thinks it's a new doc, but it exists. This is a conflict.
+                    conflictDetected = true;
+                    System.out.println(
+                            "Service: Conflict for docId " + docId + ": Client assumed new, but document exists.");
+                } else {
+                    // Client provided an assumed state. Compare its updatedAt with server's
+                    // updatedAt.
+                    Long serverUpdatedAt = existingDoc.getUpdatedAt();
+                    Object clientAssumedUpdatedAtObj = assumedMasterStateClient.get("updatedAt");
+                    Long clientAssumedUpdatedAt = null;
+                    if (clientAssumedUpdatedAtObj instanceof Number) {
+                        clientAssumedUpdatedAt = ((Number) clientAssumedUpdatedAtObj).longValue();
+                    }
+
+                    // Conflict if server's updatedAt does not match client's assumed updatedAt.
+                    // (Handles cases where one is null and the other isn't, or both non-null but
+                    // different)
+                    if (serverUpdatedAt == null && clientAssumedUpdatedAt != null)
                         conflictDetected = true;
-                        System.out.println("Service: Conflict for docId " + docId + ": Client assumed new, but document exists.");
-                    } else {
-                        // Client provided an assumed state, compare its 'updatedAt' with server's 'updatedAt'.
-                        Object realUpdatedAt = realMasterState.get("updatedAt");
-                        Object assumedUpdatedAt = assumedMasterState.get("updatedAt");
+                    else if (serverUpdatedAt != null && clientAssumedUpdatedAt == null)
+                        conflictDetected = true;
+                    else if (serverUpdatedAt != null && !serverUpdatedAt.equals(clientAssumedUpdatedAt))
+                        conflictDetected = true;
 
-                        if (realUpdatedAt == null && assumedUpdatedAt != null) {
-                            conflictDetected = true; // Server has no updatedAt, client assumes one.
-                        } else if (realUpdatedAt != null && assumedUpdatedAt == null) {
-                            conflictDetected = true; // Server has updatedAt, client assumes none.
-                        } else if (realUpdatedAt != null && !realUpdatedAt.equals(assumedUpdatedAt)) {
-                            // Both have updatedAt, but they are different.
-                            conflictDetected = true;
-                        } // If both are null, no conflict based on updatedAt.
-
-                        if (conflictDetected) {
-                             System.out.println("Service: Conflict for docId " + docId + ". Server updatedAt: " + realUpdatedAt + ", Client's assumed updatedAt: " + assumedUpdatedAt);
-                        }
+                    if (conflictDetected) {
+                        System.out.println("Service: Conflict for docId " + docId + ". Server updatedAt: "
+                                + serverUpdatedAt + ", Client's assumed updatedAt: " + clientAssumedUpdatedAt);
                     }
                 }
-                // If realMasterState is null, client is creating a new document. No conflict based on existing data.
-
-                if (conflictDetected) {
-                    conflicts.add(new HashMap<>(realMasterState)); // Add a copy of the server's version to conflicts
-                } else {
-                    // No conflict, write/update the document.
-                    // Ensure 'updatedAt' is current. If client is expected to set it, this is fine.
-                    // Otherwise, server should set/update it: newDocumentState.put("updatedAt", System.currentTimeMillis());
-                    // For this example, we assume newDocumentState contains the correct updatedAt if applicable.
-
-                    documentsStore.put(docId, new HashMap<>(newDocumentState)); // Update/insert in map store
-
-                    // Keep serverDocuments list consistent with documentsStore
-                    final String finalDocId = docId; // Required for lambda expression
-                    serverDocuments.removeIf(doc -> finalDocId.equals(doc.get("id")));
-                    serverDocuments.add(new HashMap<>(newDocumentState)); // Store a copy
-
-                    System.out.println("Service: Processed document ID: " + docId + " (no conflict detected).");
+            } else { // Document does not exist on server
+                if (assumedMasterStateClient != null) {
+                    // Client thinks doc exists (and provided assumed state), but it doesn't. This
+                    // is a conflict.
+                    // This scenario might indicate the doc was deleted on the server after client's
+                    // last pull.
+                    conflictDetected = true;
+                    System.out.println("Service: Conflict for docId " + docId
+                            + ": Client assumed existing, but document not found.");
                 }
+
+            }
+
+            if (conflictDetected) {
+                // Add server's current version to conflicts list
+                Map<String, Object> serverStateForConflict = new HashMap<>();
+                if (existingDoc != null) {
+                    serverStateForConflict.putAll(existingDoc.getData()); // Assumes getData() returns the main content
+                    serverStateForConflict.put("id", existingDoc.getId());
+                    serverStateForConflict.put("updatedAt", existingDoc.getUpdatedAt());
+                }
+                conflicts.add(serverStateForConflict);
+            } else {
+                // No conflict, proceed with write/update
+                Document docToSave = existingDoc != null ? existingDoc : new Document();
+                docToSave.setId(docId);
+
+                // Extract data, updatedAt, and deleted status from newDocClientState
+                // RxDB typically sends the full document state, including metadata like
+                // _deleted and _rev (which we might ignore or handle)
+                // The 'data' field in our Document entity should store the actual application
+                // data, excluding RxDB metadata if possible.
+                Map<String, Object> appData = new HashMap<>(newDocClientState);
+                appData.remove("id"); // id is a separate field
+                appData.remove("updatedAt"); // updatedAt is a separate field
+                appData.remove("_rev"); // RxDB revision, server might manage its own versioning or ignore
+                appData.remove("_attachments"); // Handle if you support attachments
+
+                docToSave.setData(appData);
+                docToSave.setUpdatedAt(currentProcessingTime); // Server sets the authoritative update timestamp
+
+                documentRepository.save(docToSave);
+                System.out.println("Service: Processed document ID: " + docId + ".");
             }
         }
 
-        // Update server checkpoint after processing all client changes
-        long newCp = System.currentTimeMillis();
-        serverCheckpoint.set(newCp);
-        System.out.println("Service: Push processing complete. New server checkpoint: " + newCp);
-
+        if (!conflicts.isEmpty()) {
+            System.out.println("Service: Push processing complete with " + conflicts.size() + " conflicts.");
+        } else {
+            System.out.println("Service: Push processing complete. All changes applied successfully.");
+        }
+        updateServerCheckpointTimestamp(); // Update server's latest known timestamp after all pushes
         return conflicts;
+    }
+
+    private Map<String, Object> createErrorEntry(String errorMessage, String details) {
+        Map<String, Object> errorEntry = new HashMap<>();
+        errorEntry.put("error", errorMessage);
+        errorEntry.put("details", details);
+        return errorEntry;
     }
 
     /**
      * Gets the current server checkpoint.
+     * 
      * @return CheckpointDto containing the current server checkpoint.
      */
+    @Transactional(readOnly = true)
     public CheckpointDto getCurrentCheckpoint() {
-        String currentCp = String.valueOf(serverCheckpoint.get());
-        System.out.println("Service: Providing current checkpoint: " + currentCp);
-        return new CheckpointDto(currentCp);
+        // This method is for the /checkpoint endpoint.
+        // The checkpoint should represent the latest state of the database that clients
+        // can sync from.
+        // A simple approach is the timestamp of the most recently updated document.
+        // A more robust RxDB checkpoint is an object like {lastDocId, lastUpdatedAt}.
+        // For now, let's use the serverCheckpointTimestamp which is updated after
+        // pulls/pushes.
+        updateServerCheckpointTimestamp(); // Ensure it's fresh
+        String currentCpVal = String.valueOf(serverCheckpointTimestamp.get());
+        // To be more RxDB compliant, this should ideally be the {updatedAt, id} of the
+        // latest document.
+        // Or, if no documents, a minimal value like {updatedAt: 0, id: ""}.
+        // For simplicity, returning just the timestamp string. Client-side adapter
+        // might need to parse this.
+        System.out.println("Service: Providing current server checkpoint value: " + currentCpVal);
+        return new CheckpointDto(currentCpVal); // Client might expect a more complex object
+    }
+
+    // Helper to get the latest document's ID for checkpointing, could be more
+    // sophisticated
+    private String getLastDocumentId() {
+        Pageable pageable = PageRequest.of(0, 1, org.springframework.data.domain.Sort
+                .by(org.springframework.data.domain.Sort.Direction.DESC, "updatedAt", "id"));
+        List<Document> lastDocs = documentRepository.findAll(pageable).getContent();
+        return lastDocs.isEmpty() ? "" : lastDocs.get(0).getId();
     }
 }
